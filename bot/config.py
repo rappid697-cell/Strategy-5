@@ -1,0 +1,242 @@
+import os
+import json
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Dict, Any, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+
+    MODE: str = "paper"  # "paper" or "live"
+    PAPER_BALANCE_USD: float = 1000.0
+    PRIVATE_KEY: str = ""  # hex private key, or derived from a 12/24-word seed phrase
+
+    # Live trading (Polymarket CLOB V2). The wallet is derived from PRIVATE_KEY (hex
+    # key or seed phrase). New wallets trade via the gasless deposit-wallet flow
+    # (POLY_1271); the relayer key sponsors on-chain setup (deploy/approvals).
+    CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
+    RELAYER_API_KEY: str = ""        # Polymarket relayer API key (gasless on-chain txs)
+
+    # ── Auto-withdrawal (capital extractor) ─────────────────────────────────────
+    # When the live balance reaches TRIGGER, pause entries, wait until flat, then
+    # withdraw AMOUNT of pUSD to your own wallet (the key/seed EOA) and auto-resume.
+    AUTO_WITHDRAW_ENABLED: bool = False
+    WITHDRAW_TRIGGER_BALANCE: float = 2000.0  # withdraw once balance reaches this
+    WITHDRAW_AMOUNT: float = 1000.0           # amount of pUSD to withdraw each time
+    WITHDRAW_ADDRESS: str = ""                # destination wallet (blank = your own key/seed EOA)
+    WITHDRAW_AUTO_RESUME: bool = True         # resume trading after the withdrawal
+    WITHDRAW_RESUME_AFTER: str = "submitted"  # "submitted" or "confirmed"
+
+    # ── Telegram alerts ─────────────────────────────────────────────────────────
+    # When enabled, a message is sent to your Telegram bot every time a withdrawal
+    # happens (with the time and amount).
+    TELEGRAM_ENABLED: bool = False
+    TELEGRAM_BOT_TOKEN: str = ""   # from @BotFather
+    # No manual chat id: recipients are collected automatically. Anyone who sends the
+    # bot /start (or any message) is saved to telegram_subscribers.json, and every
+    # withdrawal alert is broadcast to all of them.
+
+    SYMBOL: str = "BTCUSDT"
+    BINANCE_BASE_URL: str = "https://api.binance.com"
+    GAMMA_BASE_URL: str = "https://gamma-api.polymarket.com"
+    CLOB_BASE_URL: str = "https://clob.polymarket.com"
+
+    POLL_INTERVAL_MS: int = 1000
+    CANDLE_WINDOW_MINUTES: int = 15
+
+    # Risk per trade: "percent" = RISK_VALUE% of balance; "fixed" = RISK_VALUE dollars.
+    RISK_TYPE: str = "percent"
+    RISK_VALUE: float = 10.0
+
+    # ── Latency-arb entry engine ────────────────────────────────────────────────
+    # Fair probability (fast, from Binance spot) vs Polymarket's implied price.
+    # Enter when EV = fair - ask_price clears EV_THRESHOLD (the book looks stale).
+    EV_THRESHOLD: float = 0.04          # require >= this expected value per $1 share (after price)
+    MIN_PROB_EV: float = 0.55           # don't bet near-coinflips even if EV looks positive
+    MIN_BOOK_LIQUIDITY_USD: float = 20.0  # skip if the ask side can't absorb the stake
+
+    # ── CUSUM Change-Point trigger ──────────────────────────────────────────────
+    # Two-sided CUSUM over the directional-evidence Z = (fair_up - 0.5) per tick:
+    #   S+ = max(0, S+ + Z - K);  S- = min(0, S- + Z + K)
+    # A change-point fires when S+ >= H (bias UP) or S- <= -H (bias DOWN); on firing
+    # we ENTER that side only if it also has non-negative edge, then reset the crossed
+    # accumulator so it re-arms. K = slack (drift allowance), H = decision threshold.
+    CUSUM_K: float = 0.05   # slack / drift allowance per tick
+    CUSUM_H: float = 0.50   # accumulated-evidence threshold to declare a change-point
+
+    # Close-and-flip the open position on a strong opposite signal
+    FLIP_ENABLED: bool = False
+    FLIP_MIN_CONVICTION: float = 0.80   # opposite side's adjusted prob must be >= this
+    FLIP_MIN_MINUTES_LEFT: float = 9.0  # and at least this much time left in the window
+
+    # ── Take-profit / stop-loss (early exit) ────────────────────────────────────
+    # Close the open position early when its unrealized P/L reaches +TAKE_PROFIT_PCT
+    # or -STOP_LOSS_PCT of the stake (the amount risked on the trade). After it fires,
+    # we don't re-enter until the next 15m window. Percentages (30 = 30%).
+    TP_SL_ENABLED: bool = False
+    TAKE_PROFIT_PCT: float = 30.0       # sell if position value is up this % vs the stake
+    STOP_LOSS_PCT: float = 30.0         # sell if position value is down this % vs the stake
+
+    # ── Live Contract-Time Filter ───────────────────────────────────────────────
+    # Only OPEN live trades on contracts whose official UTC start minute is selected
+    # (0/15/30/45). Data analysis showed the :30 contract-start is strongly positive
+    # while :00 is strongly negative — this lets us trade only the chosen marks.
+    # Applies to LIVE entries only; paper/shadow trades, settlements, redemptions,
+    # position management and auto-withdrawals are never blocked.
+    #   enabled=False  -> trade every eligible contract (default; nothing changes)
+    #   enabled=True   -> open a new live trade only if its start minute is in MINUTES
+    #   enabled=True, MINUTES=[] -> block ALL live entries (warned in the UI)
+    LIVE_MINUTE_FILTER_ENABLED: bool = False
+    LIVE_MINUTE_FILTER_MINUTES: List[int] = [0, 15, 30, 45]
+
+    # Polymarket
+    POLYMARKET_SLUG: str = os.getenv("POLYMARKET_SLUG", "")
+    POLYMARKET_SERIES_ID: str = os.getenv("POLYMARKET_SERIES_ID", "10192")
+    POLYMARKET_SERIES_SLUG: str = os.getenv("POLYMARKET_SERIES_SLUG", "btc-up-or-down-15m")
+    POLYMARKET_AUTO_SELECT_LATEST: bool = os.getenv("POLYMARKET_AUTO_SELECT_LATEST", "true").lower() == "true"
+    POLYMARKET_LIVE_DATA_WS_URL: str = os.getenv("POLYMARKET_LIVE_WS_URL", "wss://ws-live-data.polymarket.com")
+    POLYMARKET_UP_LABEL: str = os.getenv("POLYMARKET_UP_LABEL", "Up")
+    POLYMARKET_DOWN_LABEL: str = os.getenv("POLYMARKET_DOWN_LABEL", "Down")
+
+    # Chainlink
+    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon.drpc.org")
+    POLYGON_RPC_URLS: List[str] = [url.strip() for url in os.getenv("POLYGON_RPC_URLS", "").split(",") if url.strip()]
+    POLYGON_WSS_URL: str = os.getenv("POLYGON_WSS_URL", "wss://polygon-bor-rpc.publicnode.com")
+    POLYGON_WSS_URLS: List[str] = [url.strip() for url in os.getenv("POLYGON_WSS_URLS", "").split(",") if url.strip()]
+    CHAINLINK_BTC_USD_AGGREGATOR: str = os.getenv("CHAINLINK_BTC_USD_AGGREGATOR", "0xc907E116054Ad103354f2D350FD2514433D57F6f")
+
+    # Alchemy — Polygon RPC used for the on-chain live-trading path (reads/setup).
+    ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
+
+    CHAINLINK_AGGREGATORS: Dict[str, str] = {
+        "BTC": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+        "ETH": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
+        "SOL": "0x39771505D18301D239916F4C88367A6010F7D2e3",
+        "XRP": "0x3454796324D6469C3110996E2E10972688045F19",
+        "DOGE": "0xbAf93Ba318f77363f82E8896a2E830206121D506",
+        "BNB": "0x82a6C67606bdc0409f959f60608226064223A57c"
+    }
+
+    def get_aggregator(self, symbol: str) -> str:
+        s = symbol.upper()
+        if s.endswith("USDT"): s = s[:-4]
+        return self.CHAINLINK_AGGREGATORS.get(s, self.CHAINLINK_BTC_USD_AGGREGATOR)
+
+    def alchemy_rpc_url(self) -> str:
+        # Polygon RPC used by the live-trading (gasless) path when a key is set.
+        return f"https://polygon-mainnet.g.alchemy.com/v2/{self.ALCHEMY_API_KEY}" if self.ALCHEMY_API_KEY else ""
+
+    # Proxy
+    HTTP_PROXY: str = os.getenv("HTTP_PROXY", os.getenv("http_proxy", ""))
+    HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", os.getenv("https_proxy", ""))
+    ALL_PROXY: str = os.getenv("ALL_PROXY", os.getenv("all_proxy", ""))
+
+def normalize_private_key(secret: str) -> str:
+    """Accept either a raw hex private key or a 12/24-word seed phrase and return a
+    hex private key. EOA only — the wallet is derived from the secret, nothing else.
+    Returns "" for empty input. Raises if a seed phrase can't be parsed."""
+    secret = (secret or "").strip()
+    if not secret:
+        return ""
+    # A mnemonic is several space-separated words; a private key is a single token.
+    if len(secret.split()) >= 12:
+        from eth_account import Account
+        Account.enable_unaudited_hdwallet_features()
+        return Account.from_mnemonic(secret).key.hex()
+    return secret
+
+
+def load_settings():
+    base_settings = Settings()
+    config_path = "config.json"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+
+            if "mode" in config_data: base_settings.MODE = config_data["mode"]
+            if "paper_balance_usd" in config_data: base_settings.PAPER_BALANCE_USD = config_data["paper_balance_usd"]
+            if "private_key" in config_data: base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
+
+            if "relayer" in config_data:
+                rl = config_data["relayer"]
+                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
+
+            if "capital_extractor" in config_data:
+                ce = config_data["capital_extractor"]
+                if "enabled" in ce: base_settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
+                if "trigger_balance" in ce: base_settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
+                if "withdraw_amount" in ce: base_settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
+                if "withdraw_address" in ce: base_settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
+                if "auto_resume_after_withdrawal" in ce: base_settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
+                if "resume_after" in ce: base_settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
+
+            if "polymarket" in config_data:
+                poly = config_data["polymarket"]
+                if "gamma_base_url" in poly: base_settings.GAMMA_BASE_URL = poly["gamma_base_url"]
+                if "clob_base_url" in poly: base_settings.CLOB_BASE_URL = poly["clob_base_url"]
+                if "live_ws_url" in poly: base_settings.POLYMARKET_LIVE_DATA_WS_URL = poly["live_ws_url"]
+                if "series_id" in poly: base_settings.POLYMARKET_SERIES_ID = poly["series_id"]
+                if "series_slug" in poly: base_settings.POLYMARKET_SERIES_SLUG = poly["series_slug"]
+                if "auto_select_latest" in poly: base_settings.POLYMARKET_AUTO_SELECT_LATEST = poly["auto_select_latest"]
+                if "up_label" in poly: base_settings.POLYMARKET_UP_LABEL = poly["up_label"]
+                if "down_label" in poly: base_settings.POLYMARKET_DOWN_LABEL = poly["down_label"]
+
+            if "trading" in config_data:
+                trading = config_data["trading"]
+                if "symbol" in trading: base_settings.SYMBOL = trading["symbol"]
+                if "binance_base_url" in trading: base_settings.BINANCE_BASE_URL = trading["binance_base_url"]
+                if "candle_window_minutes" in trading: base_settings.CANDLE_WINDOW_MINUTES = trading["candle_window_minutes"]
+                if "poll_interval_ms" in trading: base_settings.POLL_INTERVAL_MS = trading["poll_interval_ms"]
+                if "risk_type" in trading: base_settings.RISK_TYPE = trading["risk_type"]
+                if "risk_value" in trading: base_settings.RISK_VALUE = trading["risk_value"]
+
+            if "ev" in config_data:
+                ev = config_data["ev"]
+                if "ev_threshold" in ev: base_settings.EV_THRESHOLD = float(ev["ev_threshold"])
+                if "min_prob" in ev: base_settings.MIN_PROB_EV = float(ev["min_prob"])
+                if "min_book_liquidity_usd" in ev: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ev["min_book_liquidity_usd"])
+
+            if "cusum" in config_data:
+                cu = config_data["cusum"]
+                if "k" in cu: base_settings.CUSUM_K = float(cu["k"])
+                if "h" in cu: base_settings.CUSUM_H = float(cu["h"])
+
+            if "flip" in config_data:
+                flip = config_data["flip"]
+                if "enabled" in flip: base_settings.FLIP_ENABLED = bool(flip["enabled"])
+                if "min_conviction" in flip: base_settings.FLIP_MIN_CONVICTION = float(flip["min_conviction"])
+                if "min_minutes_left" in flip: base_settings.FLIP_MIN_MINUTES_LEFT = float(flip["min_minutes_left"])
+
+            if "tp_sl" in config_data:
+                ts = config_data["tp_sl"]
+                if "enabled" in ts: base_settings.TP_SL_ENABLED = bool(ts["enabled"])
+                if "take_profit_pct" in ts: base_settings.TAKE_PROFIT_PCT = float(ts["take_profit_pct"])
+                if "stop_loss_pct" in ts: base_settings.STOP_LOSS_PCT = float(ts["stop_loss_pct"])
+
+            if "live_minute_filter" in config_data:
+                lmf = config_data["live_minute_filter"]
+                if "enabled" in lmf: base_settings.LIVE_MINUTE_FILTER_ENABLED = bool(lmf["enabled"])
+                if "allowed_minutes" in lmf:
+                    # keep only valid quarter-hour marks, de-duplicated and sorted
+                    valid = {0, 15, 30, 45}
+                    mins = sorted({int(m) for m in lmf["allowed_minutes"] if int(m) in valid})
+                    base_settings.LIVE_MINUTE_FILTER_MINUTES = mins
+
+            if "telegram" in config_data:
+                tg = config_data["telegram"]
+                if "enabled" in tg: base_settings.TELEGRAM_ENABLED = bool(tg["enabled"])
+                if "bot_token" in tg: base_settings.TELEGRAM_BOT_TOKEN = tg["bot_token"]
+
+            if "chainlink" in config_data:
+                cl = config_data["chainlink"]
+                if "polygon_rpc_url" in cl: base_settings.POLYGON_RPC_URL = cl["polygon_rpc_url"]
+                if "polygon_wss_url" in cl: base_settings.POLYGON_WSS_URL = cl["polygon_wss_url"]
+                if "btc_usd_aggregator" in cl: base_settings.CHAINLINK_BTC_USD_AGGREGATOR = cl["btc_usd_aggregator"]
+                if "alchemy_api_key" in cl: base_settings.ALCHEMY_API_KEY = cl["alchemy_api_key"]
+
+        except Exception as e:
+            print(f"Warning: Failed to load config.json: {e}")
+
+    return base_settings
+
+settings = load_settings()
