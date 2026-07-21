@@ -1,0 +1,687 @@
+================================================================================
+                    POLYMARKET BTC 15-MINUTE BOT - DOCUMENTATION
+================================================================================
+
+A trading bot and web dashboard for Polymarket's "Bitcoin Up or Down" 15-minute
+markets.
+
+Every 15 minutes Polymarket opens a new binary market asking: will BTC be higher
+at the end of this 15-minute window than it was at the window's open? You buy UP
+or DOWN shares priced between $0.00 and $1.00. The winning side pays $1.00 per
+share; the losing side pays $0.
+
+This bot watches the market, decides which side (if any) is mispriced, places the
+trade, manages the position, and settles it - all automatically, in either PAPER
+(simulated) or LIVE (real money) mode.
+
+This build runs on http://localhost:8204 and its dashboard / browser-tab title is
+"BTC 15m - CUSUM".
+
+
+================================================================================
+STRATEGY: CUSUM CHANGE-POINT
+================================================================================
+
+Unlike the base latency bot - which takes a STANDING EV VIEW EVERY TICK (see
+section 1) - this variant is EVENT-TRIGGERED. It does nothing until an accumulated
+change-point score crosses a threshold, then fires ONCE. It trades the MOMENT THE
+MARKET TURNS, not a standing view.
+
+HOW IT WORKS
+
+Each tick the bot turns the model's fair probability into a directional-evidence
+score:
+
+    Z = fair_up - 0.5        (positive = evidence for UP, negative = for DOWN)
+
+and feeds it into a TWO-SIDED CUSUM (cumulative-sum change detector):
+
+    S+ = max(0,  S+ + Z - k)     accumulates UPWARD evidence
+    S- = min(0,  S- + Z + k)     accumulates DOWNWARD evidence
+
+  - k is the SLACK (drift allowance). It bleeds a little off each accumulator
+    every tick, so pure noise keeps them pinned near zero and only a genuine,
+    persistent shift builds them up.
+
+An ENTRY FIRES ONLY ON A CHANGE-POINT - the instant an accumulator crosses the
+threshold H:
+
+    S+ >=  H   ->  change-point UP    ->  enter UP
+    S- <= -H   ->  change-point DOWN  ->  enter DOWN
+
+  - H is the DECISION THRESHOLD: how much accumulated evidence is required before
+    a turn is real.
+  - The crossing side must ALSO HAVE NON-NEGATIVE EDGE (EV = fair - ask >= 0). A
+    turn the book has already repriced is not tradeable, so it is skipped (reason
+    "changepoint_<side>_ev_..._below_...").
+  - After a side fires, ONLY THE CROSSED ACCUMULATOR RESETS TO 0 - the other keeps
+    its value.
+  - BOTH ACCUMULATORS RESET TO 0 AT EVERY NEW 15-MINUTE CONTRACT BOUNDARY, so
+    evidence never carries across windows.
+
+It does NOT take standing-view entries: if no accumulator crosses this tick, there
+is NO TRADE, even when a plain EV edge exists. That is exactly what makes this the
+"trade the turn" bot.
+
+ON THE DASHBOARD
+
+The Current Prediction area adds a CUSUM readout showing the live S+ and S-
+accumulators and the LAST CHANGE-POINT that fired (its side, time, and the fair
+probability at the moment it fired). Between change-points the decision reads
+NO TRADE with a reason such as "no_change_point(S+=0.31,S-=-0.12)".
+
+CONFIG (cusum)
+
+The "cusum" block in config.json controls the detector:
+
+    "cusum": {
+      "k": 0.05,
+      "h": 0.5
+    }
+
+  k  (default 0.05)  SLACK - drift allowance bled off each accumulator per tick.
+                     Higher k = more evidence needed to overcome the noise floor
+                     (fewer, cleaner change-points).
+  h  (default 0.5)   DECISION THRESHOLD H - how far an accumulator must climb
+                     before a change-point fires. Higher h = later, higher-
+                     conviction entries; lower h = earlier, more frequent ones.
+
+
+CONTENTS
+--------------------------------------------------------------------------------
+  1.  What the strategy actually does
+  2.  Paper mode vs Live mode
+  3.  The Dashboard
+  4.  Starting and stopping the bot
+  5.  The Settings page
+  6.  Position management: Flip, Take-Profit / Stop-Loss
+  7.  How a trade is settled (win or loss)
+  8.  Auto-Withdrawal (Capital Extractor)
+  9.  Reading the Trade History
+  10. Logs and data files
+  11. Typical workflows
+  12. Safety and limitations
+
+
+================================================================================
+1. WHAT THE STRATEGY ACTUALLY DOES
+================================================================================
+
+THE CORE IDEA: LATENCY
+
+A historical study found that the "obvious" indicator model had NO predictive
+edge over a trivial baseline - "is BTC already above the window's open right
+now?". Whoever is ahead at any checkpoint usually wins, and the market prices
+that in.
+
+The only edge left is LATENCY: acting on a Binance price move before
+Polymarket's thinner order book has repriced it.
+
+
+THE PIPELINE (runs every second)
+
+  Binance spot  ->  fair probability  ->  compare to Polymarket price
+  (fast feed)       (closed-form GBM)     (edge = fair - ask price)
+
+                ->  decide      ->  size            ->  execute
+                    (EV gate)      (% of balance)      (Fill-Or-Kill order)
+
+
+STEP 1 - FAIR PROBABILITY
+Using the current Binance spot price, the window's open price, and the realized
+volatility of recent 5-minute candles, the bot computes a closed-form probability
+that BTC will close ABOVE the open. Intuitively it answers: "given the volatility
+still to come, how likely is it that price stays on the side it's currently on?"
+
+STEP 2 - THE EDGE
+Polymarket's UP/DOWN prices are normalized into an implied probability. The bot
+compares:
+
+    Edge (EV) = fair probability - the ask price you'd pay
+
+A positive edge means the book hasn't yet repriced a move the fast feed already
+sees.
+
+STEP 3 - THE ENTRY GATE
+The side with the higher EV is chosen. The bot enters ONLY IF BOTH pass:
+
+    ev_threshold   (default 0.04)  The EV must be at least this
+                                   (a 4c edge per $1 share).
+    min_prob       (default 0.55)  Never bet a near-coinflip, even if the EV
+                                   looks positive.
+
+It also skips the trade if the order book's ask side is too thin to absorb the
+stake (min_book_liquidity_usd).
+
+STEP 4 - SIZING
+The stake is either a PERCENT of your balance or a FLAT DOLLAR amount (your
+choice).
+
+STEP 5 - EXECUTION
+A Fill-Or-Kill order with a slippage cap. If the book moves away, the order is
+killed rather than filled at a bad price. ONLY ONE POSITION IS HELD AT A TIME.
+
+
+================================================================================
+2. PAPER MODE VS LIVE MODE
+================================================================================
+
+Set this at the top of the Settings page.
+
+PAPER MODE (default, safe)
+  - No real money. No wallet needed.
+  - The bot simulates a balance (you set the starting amount).
+  - Everything else - signals, entries, flips, TP/SL, settlement - behaves
+    identically.
+  - THIS IS WHERE YOU SHOULD VALIDATE THE STRATEGY BEFORE EVER GOING LIVE.
+
+LIVE MODE (real money)
+  - Places real Fill-Or-Kill orders on Polymarket CLOB V2.
+  - Your balance display becomes your real on-chain pUSD balance (refreshed
+    every ~10 seconds).
+  - Requires credentials (see Settings -> Credentials).
+
+HOW LIVE TRADING WORKS UNDER THE HOOD
+Your private key or seed phrase only SIGNS orders - it holds no funds and pays no
+gas. Your money lives in a Polymarket DEPOSIT WALLET, and a RELAYER API KEY
+sponsors the one-time on-chain setup (wallet deployment + token approvals) so you
+never pay gas. All of this is automatic before your first live order.
+
+
+================================================================================
+3. THE DASHBOARD
+================================================================================
+
+The main page (/) refreshes every second.
+
+HEADER BAR
+  Binance WS / Poly WS dots  Green = the price feeds are connected.
+                             Red = a feed is down.
+  Paper / Live Balance       Your current balance, live. Yellow in paper mode,
+                             green in live mode.
+  Start / Stop button        Turns trading on or off.
+  Withdraw badge             Only appears when auto-withdrawal is enabled; shows
+                             its current state.
+  paper / live pill          Which mode you're in.
+  Updated                    Time of the last refresh.
+
+MARKET SUMMARY
+  BTC Binance Spot        The fast price feed that drives the model.
+  Polymarket Chainlink    The settlement price feed. Below it:
+      Close src           Which feed is currently providing it
+                          (green = Polymarket WS, yellow = a fallback).
+      Open (strike)       The price the current window opened at, and where
+                          that number came from.
+  Time Remaining          Countdown to the end of the current 15-minute window.
+
+CURRENT PREDICTION
+  PROB UP / PROB DOWN     The model's fair probability for each side.
+  The big centre text is the decision: BUY UP, BUY DOWN, or NO TRADE, with the
+  reason underneath (e.g. "ev_0.018_below_0.040" means the edge wasn't big
+  enough).
+
+PANELS
+  Technical Indicators    The model's fair probability for the 15m close.
+  Polymarket Odds         The live UP/DOWN prices and the model's edge.
+
+TABS
+  Active Trades   Your open position: market, side, entry price, shares,
+                  "Opened by" (EV or FLIP), Unrealized P/L (marked against the
+                  current bid), and status.
+  Closed Trades   Full trade history (see section 9).
+  Console Log     A live event feed: entries, flips, TP/SL hits, settlements,
+                  withdrawals, errors.
+
+EQUITY VS CASH
+The Trades tab shows EQUITY = cash + the value of your open position, so the
+headline number doesn't drop just because you entered a trade. The breakdown
+(Cash $X + Open $Y) is shown beneath it.
+
+
+================================================================================
+4. STARTING AND STOPPING THE BOT
+================================================================================
+
+THE BOT BOOTS IN A STOPPED STATE. Price feeds stream and the dashboard updates,
+but NO TRADES ARE PLACED until you press START.
+
+  START  The bot may now enter trades and flip positions.
+  STOP   New entries and flips halt IMMEDIATELY. Any position already open keeps
+         running and will still settle normally at expiry (it can't get stuck).
+
+Use Stop whenever you want to pause trading without killing the app.
+
+
+================================================================================
+5. THE SETTINGS PAGE
+================================================================================
+
+Reachable via the gear icon. "Save Changes" applies everything immediately - no
+restart needed.
+
+TRADING MODE
+  Mode            "paper" or "live".
+  Paper Balance   The starting simulated balance (paper mode only).
+
+MARKET
+  Series   Which 15-minute market to trade (BTC by default; ETH and others are
+           available).
+  Symbol   The Binance symbol used for the fast price feed (e.g. BTCUSDT).
+
+RISK PER TRADE
+  Risk Type
+      percent  Stake this % of your current balance on each trade.
+      fixed    Stake this flat dollar amount each trade.
+  Risk Value
+      The number for the above (e.g. 10 = 10% of balance, or $10 if fixed).
+
+  NOTE: With percent sizing, a losing streak compounds. Keep this modest.
+
+STRATEGY CONTROLS (the entry gates)
+  EV Threshold (default 0.04)
+      The minimum edge (fair probability - share price) required to enter.
+      Raise it to trade less often but only on bigger edges; lower it to trade
+      more often.
+  Min Probability (default 0.55)
+      Don't bet near-coinflips even if the EV looks positive.
+
+CLOSE & FLIP ON STRONG OPPOSITE SIGNAL   (see section 6)
+
+TAKE-PROFIT / STOP-LOSS                  (see section 6)
+
+CREDENTIALS & LIVE TRADING  (only needed for LIVE mode)
+
+  Private Key or Seed Phrase
+      Your EOA wallet. Paste a hex private key OR a 12/24-word seed phrase - the
+      wallet is derived from it. Only the derived key is stored; the seed phrase
+      is never written to disk. This key SIGNS ORDERS ONLY - it holds no funds
+      and pays no gas.
+
+  Relayer API Key
+      Sponsors gas for the one-time on-chain setup (deposit-wallet deployment +
+      token approvals), so you never pay gas. Get it from polymarket.com ->
+      Settings -> Relayer API keys.
+
+  Alchemy RPC API Key
+      OPTIONAL. A private Polygon RPC for on-chain reads. Leave blank to use
+      public RPCs.
+
+  TEST CONNECTION button
+      Saves your credentials, then derives your wallet and reports:
+        - your EOA address
+        - which trading wallet was detected (deposit / proxy / safe) and its
+          signature type
+        - whether the relayer key is set
+        - which wallet actually holds pUSD (your tradeable funds)
+      If it says "no pUSD found yet", deposit funds on polymarket.com first.
+
+AUTO-WITHDRAWAL                          (see section 8)
+
+
+================================================================================
+6. POSITION MANAGEMENT
+================================================================================
+
+The bot holds ONE POSITION AT A TIME and, by default, holds it to expiry. Two
+optional features can exit or reverse a position early.
+
+
+--- CLOSE & FLIP ---------------------------------------------------------------
+
+WHAT IT DOES
+If you're holding a position and the model swings hard to the OPPOSITE side, the
+bot sells your current side and buys the other one.
+
+SETTINGS
+  Enabled            On/off.
+  Min Conviction     The opposite side's fair probability must be at least this
+                     (e.g. 0.65).
+  Min Minutes Left   At least this much time must remain in the 15-minute window
+                     (e.g. 4). Late in a window there isn't enough runway left
+                     for a reversal to pay off, so flips are blocked.
+
+IMPORTANT RULES
+  - ONE FLIP PER MARKET. After a flip, that position is HELD TO SETTLEMENT - the
+    bot will not flip again in the same 15-minute window, no matter what the
+    model does. This prevents costly churn.
+  - A flip is driven by FAIR PROBABILITY only, not by EV.
+  - A flip REALIZES A LOSS on the side you exit (you sell into the bid, below
+    your entry). It only makes sense when the model has genuinely turned against
+    your position.
+
+
+--- TAKE-PROFIT / STOP-LOSS ----------------------------------------------------
+
+WHAT IT DOES
+Closes the open position early when its value moves a set percentage OF THE
+AMOUNT YOU RISKED.
+
+SETTINGS
+  Enabled                    On/off.
+  Take Profit (% of stake)   Sell when the position is up this much
+                             (e.g. 30 = +30%).
+  Stop Loss (% of stake)     Sell when the position is down this much
+                             (e.g. 30 = -30%).
+
+HOW IT'S MEASURED
+The position is marked against the CURRENT BID (what you'd actually get if you
+sold right now):
+
+    P/L %  =  (shares x current bid - stake) / stake x 100
+
+EXAMPLE: you stake $100 at 50c -> 200 shares.
+  - Bid rises to 65c -> value $130 -> +30% -> TAKE-PROFIT fires, you bank ~$30.
+  - Bid falls to 35c -> value $70  -> -30% -> STOP-LOSS fires, you cut the loss
+    at ~-$30.
+
+AFTER TP OR SL FIRES, THE BOT WILL NOT RE-ENTER THAT MARKET. It waits for the
+NEXT 15-minute market to start. This stops it from immediately re-entering the
+same losing setup.
+
+NOTE: If both Flip and TP/SL are enabled, TP/SL TAKES PRECEDENCE - it runs first,
+and once it fires the market is locked so no flip can reopen a position there.
+
+
+================================================================================
+7. HOW A TRADE IS SETTLED
+================================================================================
+
+Polymarket resolves these markets on CHAINLINK - the price at the window's close
+versus the price at the window's open. The bot mirrors this exactly.
+
+MARKING THE OPEN
+At the instant a 15-minute window begins, the bot snapshots the Polymarket
+Chainlink WS price and stores it as that window's open (the "strike"). You can
+see it on the dashboard as "Open (strike)".
+
+  IMPORTANT: If the bot did not capture a window's open (for example, it was
+  started mid-window), it will NOT TRADE THAT WINDOW AT ALL. It waits for the
+  next window, where it can mark the real open. This is deliberate: without a
+  true open, a trade can't be scored correctly.
+
+MARKING THE CLOSE
+The moment the window expires, the Chainlink price is FROZEN as the close. It is
+not allowed to drift afterwards.
+
+DECIDING WIN OR LOSS, in priority order:
+
+  1. POLYMARKET'S OWN SETTLEMENT - once the market officially resolves (the
+     winning outcome trades at ~$1), that is authoritative and always wins.
+
+  2. CLOSE VS OPEN - before Polymarket resolves, the bot compares the frozen
+     Chainlink close against the marked Chainlink open. close > open -> UP wins;
+     otherwise DOWN wins. Both values come from the same feed, so no price offset
+     can flip the result.
+
+  3. VOID - if a trade still can't be resolved 5 minutes past expiry, it is
+     voided and the stake is refunded (paper mode).
+
+Every settlement is logged with the full picture, e.g.:
+
+    WIN [close_vs_open] UP: open 67380.00 -> close 67421.50 (UP by 41.50)
+        -> P/L $+104.00
+
+PAYOUTS
+  Win at expiry               Each share pays $1.00 -> P/L = shares - stake
+  Loss at expiry              Shares are worth $0    -> P/L = -stake
+  Early exit (Flip/TP/SL)     You sold your shares   -> P/L = shares x sell price
+                                                                - stake
+
+
+================================================================================
+8. AUTO-WITHDRAWAL (CAPITAL EXTRACTOR)
+================================================================================
+
+Automatically pulls profit out of the trading wallet once your EQUITY grows past
+a threshold, then resumes trading. LIVE MODE ONLY.
+
+SETTINGS
+  Enable auto-withdrawal   Master on/off.
+  Trigger Balance          Withdraw once your EQUITY reaches this (e.g. 2000).
+  Withdraw Amount          How much pUSD to withdraw each time
+                           (e.g. 1000 = half of 2000).
+  Withdraw To              Destination address. LEAVE BLANK TO SEND TO YOUR OWN
+                           WALLET (the address derived from your key/seed).
+  Auto-resume after
+    withdrawal             ON:  trading resumes at the next 15m market.
+                           OFF: the bot is STOPPED COMPLETELY after withdrawing.
+  Resume After             "submitted" (immediately, the default) or "confirmed".
+
+
+IT TRIGGERS ON EQUITY, NOT JUST CASH
+EQUITY = cash balance + the current value of any open position. This means a
+RUNNING TRADE STILL COUNTS toward the trigger - you don't have to wait for it to
+settle for the threshold to be reached.
+
+IT CLOSES AN OPEN TRADE IMMEDIATELY
+If a trade is OPEN when equity hits the trigger, the bot CLOSES IT RIGHT AWAY
+(sells at the current bid) so the funds settle into cash and the withdrawal can
+proceed. It does not wait for expiry.
+
+
+THE STATE MACHINE
+
+    ARMED
+      |   EQUITY (cash + open position value) reaches the trigger
+      v
+    WAITING_FLAT
+      |   New entries PAUSED.
+      |   Any OPEN TRADE IS CLOSED IMMEDIATELY (sold at the bid).
+      |   Account goes flat, funds settle.
+      v
+    WITHDRAWING
+      |   Sends the withdrawal (gasless, via the relayer).
+      v
+    WITHDRAW_SUBMITTED
+      |
+      v
+    ARMED
+      +-- auto-resume ON  -> trading resumes at the NEXT 15m market
+      |                      (the current one stays locked)
+      +-- auto-resume OFF -> the bot is STOPPED
+                             (press Start to trade again)
+
+The current state is shown on the dashboard as the withdraw badge (green when
+ARMED, amber while a withdrawal is in progress). A trade closed this way appears
+in the history with exit reason "withdraw_close".
+
+  WARNING: Withdrawals move REAL FUNDS and cannot be undone. Double-check the
+  destination address, and do one small test withdrawal before relying on the
+  automatic trigger.
+
+  WARNING: Because it force-closes an open position, a withdrawal REALIZES
+  WHATEVER P/L THAT POSITION CURRENTLY HAS (selling into the bid). Set the
+  trigger at a level where you're happy to exit.
+
+
+TELEGRAM ALERTS (ON WITHDRAWAL)
+
+Every time a withdrawal completes, the bot broadcasts a message with the TIME
+and AMOUNT to EVERYONE who has subscribed. Subscription is AUTOMATIC - there are
+no chat IDs to copy. Configure it in Settings -> Telegram Alerts:
+
+  Send Telegram alerts    Master on/off.
+    on withdrawal
+  Bot Token               Create a bot with @BotFather on Telegram and paste its
+                          token.
+  Subscribers panel       Live list of everyone currently subscribed. "Refresh"
+                          re-fetches it; the X next to a name removes that
+                          subscriber.
+  Send Test button        Saves your settings and broadcasts a test message to
+                          every subscriber so you can confirm it works.
+
+HOW PEOPLE SUBSCRIBE (NO CHAT IDS NEEDED):
+
+While the bot is running it quietly watches for messages sent to it. Anyone who
+wants alerts just:
+
+  1. A single user: opens your bot on Telegram and sends /start (or any
+     message). They are added to the Subscribers list automatically and will
+     get every withdrawal alert.
+
+  2. A group: add the bot to the group and send any message - the group is
+     subscribed (its id is a negative number).
+
+  3. A channel: add the bot as an ADMIN and post once - the channel is
+     subscribed.
+
+To stop receiving alerts, a user sends /stop to the bot (or you remove them with
+the X in the Subscribers panel).
+
+  WARNING: Telegram does not allow a bot to start a conversation, so each person
+  must message the bot FIRST - that single message is what subscribes them. The
+  bot must be RUNNING for it to pick up new subscribers. Subscribers are saved to
+  telegram_subscribers.json and persist across restarts.
+
+REACHING MULTIPLE PEOPLE
+
+  - Many individual users -> each person sends /start to the bot once; all of
+    them receive every alert. Unlimited recipients.
+  - One group or channel everyone joins -> add the bot there and post once; the
+    bot broadcasts to it and everyone in it sees the alert.
+
+The alert looks like:
+
+    Withdrawal completed
+    Amount: $1000.00
+    Time: 2026-07-13 04:51:44
+    To: 0x....
+    Tx: 0x....
+
+Alerts are best-effort - if Telegram is unreachable, trading is never affected.
+
+
+================================================================================
+9. READING THE TRADE HISTORY
+================================================================================
+
+Each closed trade shows:
+
+  Market        Which 15-minute market.
+  Side          UP or DOWN.
+  Entry         The price you paid per share (in cents).
+  Opened by     EV   = opened by the normal signal.
+                FLIP = opened by a flip reversal.
+  Exit          How the trade ended (see below).
+  Open->Close   The market's actual move, e.g. 67,380 -> 67,421 (up).
+                Green = price rose, red = fell.
+  P/L           Realized profit or loss in dollars.
+  Settled       When it closed.
+
+EXIT VALUES
+
+  SETTLED         Held to expiry and resolved normally.
+  TP              Closed early by TAKE-PROFIT.
+  SL              Closed early by STOP-LOSS.
+  FLIP (won)      Flipped out of this side - and this side WENT ON TO WIN the
+                  market. (You exited a winner.)
+  FLIP (lost)     Flipped out of this side - and this side LOST the market.
+                  (Flipping saved you.)
+  WITHDRAW_CLOSE  Closed by the auto-withdrawal to go flat before extracting
+                  funds.
+  VOID            Couldn't be resolved; stake refunded, P/L $0.
+
+Reading a row end-to-end tells you the whole story. For example:
+
+    DOWN | 45c | EV | FLIP (won) | 63,986 -> 63,935 (down) | -$51.45
+
+means: the signal correctly entered DOWN at 45c, the market DID go down (so DOWN
+won), BUT the bot flipped out of it early and booked a $51 loss on a trade that
+would have won.
+
+
+================================================================================
+10. LOGS AND DATA FILES
+================================================================================
+
+  logs/signals.csv    ONE ROW PER TICK. The full decision record - model
+                      probabilities, market prices, the edge, the chosen side's
+                      probability/price/EV, the decision, the exact reason it did
+                      or didn't trade, and the execution result. This is the file
+                      to analyse if you want to mine for better filters.
+
+  state_data.json     Persisted balance, open positions, and trade history.
+                      Survives restarts.
+
+  config.json         All your settings (also editable from the Settings page).
+
+  Console Log tab     A human-readable live event feed of the same activity.
+
+
+KEY signals.csv COLUMNS
+
+  model_up / model_down        The model's fair probabilities.
+  mkt_up / mkt_down            Polymarket's prices.
+  edge_up / edge_down          The model's edge on each side.
+  chosen_side, chosen_prob,
+  chosen_price, chosen_ev      The side the engine picked and its inputs, logged
+                               EVEN WHEN IT DIDN'T TRADE.
+  reason                       Precisely why (e.g. ev_enter,
+                               prob_0.46_below_0.55, ev_0.011_below_0.040).
+  exec_result                  What happened (entered, slot_busy, thin_book,
+                               stopped, take_profit, stop_loss, tp_sl_locked,
+                               withdraw_locked, no_open_price, flipped_to_DOWN,
+                               ...).
+
+  NOTE: If you change the CSV columns, delete the old logs/signals.csv so a fresh
+  file with the new header is written.
+
+
+================================================================================
+11. TYPICAL WORKFLOWS
+================================================================================
+
+TRYING THE STRATEGY SAFELY
+  1. Set Mode = paper and a Paper Balance.
+  2. Choose your Risk Type / Risk Value (start small - e.g. 3-5% of balance).
+  3. Leave Flip and TP/SL off to see the raw strategy first.
+  4. Press START and let it run for at least a day or two.
+  5. Review the Closed Trades tab and logs/signals.csv. Look at win rate and net
+     P/L.
+
+TESTING A FEATURE (A/B)
+  Run for a stretch with a feature OFF, then a stretch with it ON, and compare
+  the History tab. Since features are toggles, this is easy - e.g. run TP/SL off
+  for a day, then on for a day.
+
+GOING LIVE
+  1. VALIDATE IN PAPER FIRST. Do not skip this.
+  2. Settings -> Credentials: enter your key/seed and relayer key. Press TEST
+     CONNECTION and confirm it finds your wallet.
+  3. Deposit funds on polymarket.com so your deposit wallet holds pUSD.
+  4. Set Mode = live. Keep Risk Value small to start.
+  5. Press START. Watch the Console Log for the first order.
+  6. Optionally enable Auto-Withdrawal to bank profit automatically.
+
+PAUSING
+  Press STOP. Open positions still settle; no new trades are taken.
+
+
+================================================================================
+12. SAFETY AND LIMITATIONS
+================================================================================
+
+THIS IS NOT FINANCIAL ADVICE. LIVE MODE TRADES REAL MONEY AT YOUR OWN RISK.
+
+  * THE EDGE IS UNPROVEN. The strategy's premise is that Polymarket's book is
+    slower than Binance. That may or may not hold at any given time. RUN IN PAPER
+    MODE AND CONFIRM PROFITABLE TRADES ACTUALLY APPEAR BEFORE RISKING CAPITAL.
+
+  * PAPER RESULTS OVERSTATE LIVE RESULTS. Paper fills happen at the quoted price
+    with NO SPREAD AND NO SLIPPAGE. In live trading you buy at the ask and sell
+    at the bid. On a near-coinflip market, a 1-2c spread can consume most of a
+    thin edge. Measure the real spread before trusting paper P/L.
+
+  * PERCENT SIZING COMPOUNDS LOSSES. A run of losses at 10% of balance each
+    shrinks the account fast. Size conservatively.
+
+  * THE MARKET CAN TREND AGAINST THE MODEL. These are short-horizon binaries;
+    sustained directional moves can produce long losing streaks.
+
+  * WITHDRAWALS ARE IRREVERSIBLE. Verify the destination address; test with a
+    small amount.
+
+  * EARLY EXITS COST MONEY. Flips and stop-losses sell into the bid, realizing a
+    loss plus the spread. They protect you from worse outcomes but are not free.
+
+================================================================================
