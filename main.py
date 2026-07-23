@@ -414,46 +414,6 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         }
     }
 
-# ── Live Contract-Time Filter ───────────────────────────────────────────────────
-VALID_START_MINUTES = frozenset({0, 15, 30, 45})
-
-def contract_start_minute(market: Dict[str, Any]) -> Optional[int]:
-    """The UTC minute (0/15/30/45) on which this 15m contract STARTED.
-
-    Derived from the official close (endDate) minus the window length, so it
-    reflects the contract's official start — NOT when we evaluated the signal or
-    sent the order. Returns None if the start can't be determined."""
-    end_date_str = market.get("endDate")
-    if not end_date_str:
-        return None
-    try:
-        end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-    except Exception:
-        return None
-    start_dt = (end_dt - timedelta(minutes=settings.CANDLE_WINDOW_MINUTES)).astimezone(timezone.utc)
-    minute = start_dt.minute
-    if minute in VALID_START_MINUTES:
-        return minute
-    # snap to nearest quarter mark in case the close is a few seconds off a boundary
-    return min(VALID_START_MINUTES, key=lambda q: min(abs(q - minute), 60 - abs(q - minute)))
-
-def live_entry_allowed(market: Dict[str, Any]) -> Tuple[bool, str]:
-    """Whether a LIVE entry is permitted on this contract, per the Live Contract-Time
-    Filter. Returns (allowed, reason). Only meaningful in live mode — callers gate on
-    mode themselves. Reasons mirror the doc spec for clear system logging."""
-    if not settings.LIVE_MINUTE_FILTER_ENABLED:
-        return True, "minute_filter_disabled"
-    allowed = settings.LIVE_MINUTE_FILTER_MINUTES or []
-    if not allowed:
-        return False, "minute_filter_enabled_no_minutes_selected"
-    m = contract_start_minute(market)
-    if m is None:
-        return False, "unknown_contract_start_minute"
-    if m in allowed:
-        return True, f"start_minute_{m:02d}_enabled"
-    return False, f"start_minute_{m:02d}_disabled"
-
-
 async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None, strike_source: str = "chainlink_ws"):
     # Regular entry from decision engine. Returns a short reason string describing
     # the outcome (entered / which gate vetoed it) for diagnostic logging.
@@ -546,14 +506,6 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         return "entered"
     else:
         # LIVE: place a real Fill-Or-Kill market BUY on the Polymarket CLOB.
-        # Live Contract-Time Filter — final guard, evaluated immediately before the
-        # order is sent so a settings change since the signal was raised is honoured
-        # (paper mode never reaches here, so paper/shadow trading is unaffected).
-        allowed, reason = live_entry_allowed(market)
-        if not allowed:
-            log_message(f"LIVE ENTRY BLOCKED [{side}] on {market.get('slug')}: {reason}")
-            return f"live_minute_blocked:{reason}"
-
         token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
         if not token_id:
             log_message(f"LIVE trade aborted: missing token_id for side {side}")
@@ -1175,7 +1127,7 @@ async def update_loop():
             # Fast closed-form fair probability (replaces 1000-sim Monte Carlo —
             # backtest-verified equivalent, ~1000x cheaper, which a latency play needs).
             drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
+            fair_up = indicators.fair_prob_up((current_price or spot_price) or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
             fair_data = {
                 "prob_up": fair_up,
                 "prob_down": 1.0 - fair_up,
@@ -1402,14 +1354,6 @@ async def update_loop():
                         "amount": settings.WITHDRAW_AMOUNT,
                         "last": state["last_withdrawal"],
                     },
-                    "live_filter": {
-                        "enabled": settings.LIVE_MINUTE_FILTER_ENABLED,
-                        "minutes": settings.LIVE_MINUTE_FILTER_MINUTES,
-                        # start minute of the current contract + whether a live entry
-                        # is currently permitted on it (for the dashboard badge)
-                        "current_start_minute": contract_start_minute(poly_snapshot["market"]) if poly_snapshot["ok"] else None,
-                        "current_allowed": (live_entry_allowed(poly_snapshot["market"])[0] if poly_snapshot["ok"] else None),
-                    }
                 },
                 "prices": {
                     "spot": spot_price,
@@ -1516,10 +1460,6 @@ async def get_settings():
             "take_profit_pct": settings.TAKE_PROFIT_PCT,
             "stop_loss_pct": settings.STOP_LOSS_PCT
         },
-        "live_minute_filter": {
-            "enabled": settings.LIVE_MINUTE_FILTER_ENABLED,
-            "allowed_minutes": settings.LIVE_MINUTE_FILTER_MINUTES
-        },
         "telegram": {
             "enabled": settings.TELEGRAM_ENABLED,
             "bot_token": "set" if settings.TELEGRAM_BOT_TOKEN else ""
@@ -1601,15 +1541,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "enabled" in ts: settings.TP_SL_ENABLED = bool(ts["enabled"])
         settings.TAKE_PROFIT_PCT = float(ts.get("take_profit_pct", settings.TAKE_PROFIT_PCT))
         settings.STOP_LOSS_PCT = float(ts.get("stop_loss_pct", settings.STOP_LOSS_PCT))
-
-    if "live_minute_filter" in new_settings:
-        lmf = new_settings["live_minute_filter"]
-        if "enabled" in lmf: settings.LIVE_MINUTE_FILTER_ENABLED = bool(lmf["enabled"])
-        if "allowed_minutes" in lmf:
-            valid = {0, 15, 30, 45}
-            settings.LIVE_MINUTE_FILTER_MINUTES = sorted(
-                {int(m) for m in (lmf["allowed_minutes"] or []) if int(m) in valid}
-            )
 
     if "telegram" in new_settings:
         tg = new_settings["telegram"]

@@ -76,18 +76,6 @@ class Settings(BaseSettings):
     TAKE_PROFIT_PCT: float = 30.0       # sell if position value is up this % vs the stake
     STOP_LOSS_PCT: float = 30.0         # sell if position value is down this % vs the stake
 
-    # ── Live Contract-Time Filter ───────────────────────────────────────────────
-    # Only OPEN live trades on contracts whose official UTC start minute is selected
-    # (0/15/30/45). Data analysis showed the :30 contract-start is strongly positive
-    # while :00 is strongly negative — this lets us trade only the chosen marks.
-    # Applies to LIVE entries only; paper/shadow trades, settlements, redemptions,
-    # position management and auto-withdrawals are never blocked.
-    #   enabled=False  -> trade every eligible contract (default; nothing changes)
-    #   enabled=True   -> open a new live trade only if its start minute is in MINUTES
-    #   enabled=True, MINUTES=[] -> block ALL live entries (warned in the UI)
-    LIVE_MINUTE_FILTER_ENABLED: bool = False
-    LIVE_MINUTE_FILTER_MINUTES: List[int] = [0, 15, 30, 45]
-
     # Polymarket
     POLYMARKET_SLUG: str = os.getenv("POLYMARKET_SLUG", "")
     POLYMARKET_SERIES_ID: str = os.getenv("POLYMARKET_SERIES_ID", "10192")
@@ -212,15 +200,6 @@ def load_settings():
                 if "enabled" in ts: base_settings.TP_SL_ENABLED = bool(ts["enabled"])
                 if "take_profit_pct" in ts: base_settings.TAKE_PROFIT_PCT = float(ts["take_profit_pct"])
                 if "stop_loss_pct" in ts: base_settings.STOP_LOSS_PCT = float(ts["stop_loss_pct"])
-
-            if "live_minute_filter" in config_data:
-                lmf = config_data["live_minute_filter"]
-                if "enabled" in lmf: base_settings.LIVE_MINUTE_FILTER_ENABLED = bool(lmf["enabled"])
-                if "allowed_minutes" in lmf:
-                    # keep only valid quarter-hour marks, de-duplicated and sorted
-                    valid = {0, 15, 30, 45}
-                    mins = sorted({int(m) for m in lmf["allowed_minutes"] if int(m) in valid})
-                    base_settings.LIVE_MINUTE_FILTER_MINUTES = mins
 
             if "telegram" in config_data:
                 tg = config_data["telegram"]

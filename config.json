@@ -50,10 +50,6 @@
     "take_profit_pct": 30,
     "stop_loss_pct": 30
   },
-  "live_minute_filter": {
-    "enabled": false,
-    "allowed_minutes": [0, 15, 30, 45]
-  },
   "telegram": {
     "enabled": false,
     "bot_token": ""
